@@ -14,8 +14,7 @@ from fastapi import APIRouter
 from app.config import settings
 
 # APIRouter is like a "mini FastAPI app" for a specific group of routes.
-# We'll create one router per feature (health, linkedin, gmail, etc.)
-# and register them all in main.py
+# Each feature area can have its own router, which is registered in main.py.
 router = APIRouter(
     prefix="/health",   # All routes in this file start with /health
     tags=["Health"],    # Groups them under "Health" in the API docs

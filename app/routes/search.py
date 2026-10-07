@@ -23,8 +23,6 @@ separate, later step.
 """
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.schemas.job import SearchRequest, SearchResponse, ContactDiscoveryResponse
 from app.services.search_service import run_search, run_contact_discovery
 from app.db.database import get_db
@@ -37,35 +35,24 @@ router = APIRouter(
 
 @router.post(
     "/",
-    response_model=SearchResponse,    # FastAPI validates the return value matches this shape
+    response_model=SearchResponse,
     summary="Search remote jobs by keyword",
     description=(
         "Accepts a job keyword and returns matching remote jobs from the "
-        "RemoteOK public API (or mock data if USE_MOCK_DATA=True). "
-        "New jobs are saved to SQLite; duplicates are skipped."
+        "RemoteOK public API. New jobs are saved to MongoDB; duplicates "
+        "are skipped."
     ),
 )
 async def search_jobs(
     request: SearchRequest,
-    db: AsyncSession = Depends(get_db),   # Injects a DB session per request
+    db=Depends(get_db),
 ) -> SearchResponse:
-    """
-    POST /search/
 
-    Request body:
-        { "keyword": "Java Developer Contract" }
+    result = await run_search(
+        db=db,
+        keyword=request.keyword,
+    )
 
-    Response:
-        {
-            "success": true,
-            "keyword_searched": "Java Developer Contract",
-            "total_results": 3,
-            "results": [ { "job_id": "...", "title": "...", ... } ]
-        }
-
-    Side effect: any job not already in the database (by RemoteOK ID) is saved.
-    """
-    result = await run_search(db=db, keyword=request.keyword)
     return result
 
 
@@ -74,11 +61,9 @@ async def search_jobs(
     response_model=ContactDiscoveryResponse,
     summary="Find public recruiter/HR emails for saved jobs",
     description=(
-        "For jobs already saved in SQLite that haven't been checked yet, "
+        "For jobs already saved in MongoDB that haven't been checked yet, "
         "visits each company's own public website and looks for a "
-        "recruiting/HR email on their Careers, Contact, About, Team, or "
-        "Jobs pages. Only reads publicly published pages — no login, no "
-        "scraping of LinkedIn or any gated content. Does NOT send any email."
+        "recruiting/HR email on public pages. Does NOT send any email."
     ),
 )
 async def discover_contacts(
@@ -88,34 +73,12 @@ async def discover_contacts(
         le=50,
         description="Max number of pending jobs to process in this call",
     ),
-    db: AsyncSession = Depends(get_db),
+    db=Depends(get_db),
 ) -> ContactDiscoveryResponse:
-    """
-    POST /search/discover-contacts?limit=10
 
-    No request body needed — this works off jobs already saved in SQLite
-    whose contact_status is still "not_attempted".
+    result = await run_contact_discovery(
+        db=db,
+        limit=limit,
+    )
 
-    Response:
-        {
-            "success": true,
-            "jobs_processed": 10,
-            "emails_found": 4,
-            "results": [
-                {
-                    "job_id": 3,
-                    "company": "Acme Corp",
-                    "company_website": "https://www.acmecorp.com",
-                    "contact_page_url": "https://www.acmecorp.com/careers",
-                    "recruiter_email": "careers@acmecorp.com",
-                    "contact_status": "found"
-                },
-                ...
-            ]
-        }
-
-    Side effect: updates company_website, contact_page_url,
-    recruiter_email, and contact_status on each processed Job row.
-    """
-    result = await run_contact_discovery(db=db, limit=limit)
     return result

@@ -1,38 +1,28 @@
 """
 services/search_service.py — Search Business Logic
 ----------------------------------------------------
-The SERVICE layer contains the actual logic of your feature.
-
-Why separate services from routes?
-  - Routes handle HTTP (request in -> response out). That's it.
-  - Services handle WHAT to do with that request.
-  - This separation means you can call the same logic from a route,
-    a CLI script, a test, or a scheduled job - without duplicating code.
-
-Step 5 update (this version):
-  - Added run_contact_discovery(): for jobs already saved in SQLite,
-    visits the company's own public website and looks for a publicly
-    listed recruiting/HR email on Careers/Contact/About/Team/Jobs pages.
-  - This does NOT scrape LinkedIn and does NOT send any emails — it only
-    reads pages a company has published for the public, the same way a
-    human applicant would when researching where to send a resume.
-  - Every job is updated with a contact_status so nothing is silently
-    skipped: "found", "no_website", "no_email_found", or "error".
+Handles job searching, MongoDB persistence, and contact discovery.
 """
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime, timezone
+
+from pymongo.errors import DuplicateKeyError
 
 from app.config import settings
-from app.schemas.job import JobResult, SearchResponse, ContactDiscoveryResult, ContactDiscoveryResponse
-from app.models.job import Job
+from app.schemas.job import (
+    JobResult,
+    SearchResponse,
+    ContactDiscoveryResult,
+    ContactDiscoveryResponse,
+)
 from app.services.remoteok_service import search_remoteok_jobs
 from app.services.contact_discovery_service import discover_contact_for_job
 
-# --- Mock Data Pool --------------------------------------------------------
-# Used only when settings.use_mock_data=True (.env). Keeps the SAME shape
-# that normalize_job() in remoteok_service.py produces, so save_new_jobs()
-# and the rest of the pipeline don't need separate code paths.
+
+# ---------------------------------------------------------------------------
+# Mock Data
+# ---------------------------------------------------------------------------
+
 MOCK_JOBS = [
     {
         "remoteok_id": "mock-1",
@@ -84,86 +74,81 @@ MOCK_JOBS = [
 
 def get_mock_jobs(keyword: str) -> list[dict]:
     """
-    Filters the mock pool to return only records that match the keyword.
-    Same matching style as the old version: any tag found in the keyword
-    counts as a match. Falls back to ALL mock jobs if nothing matches,
-    so a demo never returns an empty list.
+    Filter mock jobs by keyword.
     """
+
     keyword_lower = keyword.lower()
 
     matched = [
-        job for job in MOCK_JOBS
+        job
+        for job in MOCK_JOBS
         if any(tag in keyword_lower for tag in job["tags"])
     ]
 
     return matched if matched else MOCK_JOBS
 
 
-async def save_new_jobs(db: AsyncSession, jobs: list[dict], keyword: str) -> None:
-    """
-    Saves job records to SQLite, skipping any remoteok_id already stored.
+# ---------------------------------------------------------------------------
+# MongoDB Persistence
+# ---------------------------------------------------------------------------
 
-    Why check first instead of letting the DB reject duplicates?
-      - The Job model has unique=True on remoteok_id, which WOULD raise
-        an error on a duplicate insert. Checking first keeps the logic
-        explicit and avoids try/except noise for a beginner project.
-
-    Args:
-        db: The active database session (injected by FastAPI via Depends)
-        jobs: List of normalized job dicts (from RemoteOK or mock data)
-        keyword: The keyword that produced these results (saved for tracking)
+async def save_new_jobs(db, jobs: list[dict], keyword: str) -> None:
     """
+    Save new jobs to MongoDB.
+
+    Existing RemoteOK IDs are skipped.
+    """
+
     for item in jobs:
-        existing = await db.execute(
-            select(Job).where(Job.remoteok_id == item["remoteok_id"])
-        )
-        already_exists = existing.scalar_one_or_none()
 
-        if already_exists is None:
-            new_job = Job(
-                remoteok_id=item["remoteok_id"],
-                title=item["title"],
-                company=item["company"],
-                location=item.get("location"),
-                tags=",".join(item.get("tags", [])),
-                apply_url=item["apply_url"],
-                keyword_searched=keyword,
-            )
-            db.add(new_job)
+        document = {
+            "remoteok_id": item["remoteok_id"],
+            "title": item["title"],
+            "company": item["company"],
+            "location": item.get("location"),
+            "tags": item.get("tags", []),
+            "apply_url": item["apply_url"],
+            "keyword_searched": keyword,
 
-    # Commit writes all new rows to recruiter_bot.db in one go
-    await db.commit()
+            # Contact discovery fields
+            "company_website": None,
+            "contact_page_url": None,
+            "recruiter_email": None,
+            "contact_status": "not_attempted",
+
+            # Future feature
+            "application_sent": False,
+
+            # When this document was first stored
+            "created_at": datetime.now(timezone.utc),
+        }
+
+        try:
+            await db.insert_one(document)
+
+        except DuplicateKeyError:
+            # Same RemoteOK job already exists.
+            continue
 
 
-async def run_search(db: AsyncSession, keyword: str) -> SearchResponse:
+# ---------------------------------------------------------------------------
+# Job Search
+# ---------------------------------------------------------------------------
+
+async def run_search(db, keyword: str) -> SearchResponse:
     """
-    Main entry point called by the route.
-
-    Steps:
-      1. Get jobs - either from RemoteOK's live API or mock data,
-         depending on settings.use_mock_data
-      2. Save any NEW jobs to SQLite (duplicates are skipped)
-      3. Convert raw dicts -> JobResult Pydantic models
-      4. Wrap everything in a SearchResponse envelope
-
-    Args:
-        db: Active async DB session, injected by the route
-        keyword: Job keyword from the API request
-
-    Returns:
-        SearchResponse - the fully structured response object
+    Search RemoteOK and save new jobs to MongoDB.
     """
+
     if settings.use_mock_data:
         jobs = get_mock_jobs(keyword)
     else:
         jobs = await search_remoteok_jobs(keyword)
 
-    # Persist new jobs to SQLite (existing remoteok_ids are silently skipped)
+    # Save jobs into MongoDB
     await save_new_jobs(db, jobs, keyword)
 
-    # Convert each plain dict into a typed JobResult object.
-    # Contact fields default to "not_attempted" here — discovery is a
-    # separate step (run_contact_discovery), not part of every search.
+    # Convert RemoteOK results into API response objects
     job_results = [
         JobResult(
             job_id=item["remoteok_id"],
@@ -189,59 +174,59 @@ async def run_search(db: AsyncSession, keyword: str) -> SearchResponse:
     )
 
 
-async def run_contact_discovery(db: AsyncSession, limit: int = 10) -> ContactDiscoveryResponse:
+# ---------------------------------------------------------------------------
+# Contact Discovery
+# ---------------------------------------------------------------------------
+
+async def run_contact_discovery(
+    db,
+    limit: int = 10,
+) -> ContactDiscoveryResponse:
     """
-    Finds jobs in SQLite that haven't had contact discovery attempted yet
-    (contact_status == "not_attempted"), and for each one, visits the
-    company's public website looking for a recruiting/HR email.
+    Find jobs whose contact discovery has not been attempted yet.
 
-    Why work off the database instead of taking jobs as a parameter?
-      - Contact discovery is meant to run AFTER a search has already
-        saved jobs. This keeps the two steps independent: you can search
-        many times, then run discovery once on everything pending.
-
-    Args:
-        db: Active async DB session, injected by the route
-        limit: Max number of jobs to process in this call (keeps each
-               request fast and avoids hammering many company sites at once)
-
-    Returns:
-        ContactDiscoveryResponse summarizing what was found
+    Discover public company contact information and update MongoDB.
     """
-    pending = await db.execute(
-        select(Job).where(Job.contact_status == "not_attempted").limit(limit)
+
+    cursor = (
+        db.find({"contact_status": "not_attempted"})
+        .limit(limit)
     )
-    jobs_to_process = pending.scalars().all()
+
+    jobs_to_process = await cursor.to_list(length=limit)
 
     results: list[ContactDiscoveryResult] = []
     emails_found = 0
 
     for job in jobs_to_process:
-        outcome = await discover_contact_for_job(job.company)
 
-        # Update the row in place — SQLAlchemy tracks this change and
-        # writes it on commit() below.
-        job.company_website = outcome["company_website"]
-        job.contact_page_url = outcome["contact_page_url"]
-        job.recruiter_email = outcome["recruiter_email"]
-        job.contact_status = outcome["contact_status"]
+        outcome = await discover_contact_for_job(job["company"])
+
+        update_data = {
+            "company_website": outcome["company_website"],
+            "contact_page_url": outcome["contact_page_url"],
+            "recruiter_email": outcome["recruiter_email"],
+            "contact_status": outcome["contact_status"],
+        }
+
+        await db.update_one(
+            {"_id": job["_id"]},
+            {"$set": update_data},
+        )
 
         if outcome["contact_status"] == "found":
             emails_found += 1
 
         results.append(
             ContactDiscoveryResult(
-                job_id=job.id,
-                company=job.company,
-                company_website=job.company_website,
-                contact_page_url=job.contact_page_url,
-                recruiter_email=job.recruiter_email,
-                contact_status=job.contact_status,
+                job_id=str(job["_id"]),
+                company=job["company"],
+                company_website=outcome["company_website"],
+                contact_page_url=outcome["contact_page_url"],
+                recruiter_email=outcome["recruiter_email"],
+                contact_status=outcome["contact_status"],
             )
         )
-
-    # Commit all updates from this batch in one go
-    await db.commit()
 
     return ContactDiscoveryResponse(
         success=True,

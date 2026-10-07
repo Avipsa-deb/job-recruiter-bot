@@ -42,7 +42,7 @@ class ContactDiscoveryResult(BaseModel):
     """
     One job's contact-discovery outcome, returned by POST /search/discover-contacts.
     """
-    job_id: int = Field(..., description="Internal database ID of the job")
+    job_id: str = Field(..., description="MongoDB ID of the job")
     company: str = Field(..., description="Company name")
     company_website: Optional[str] = Field(None, description="Discovered company homepage, if found")
     contact_page_url: Optional[str] = Field(None, description="Page the email was found on, if any")

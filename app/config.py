@@ -30,12 +30,10 @@ class Settings(BaseSettings):
     contact_discovery_delay_seconds: float = 1.0
 
     # ─── Database ───────────────────────────────────────────
-    database_url: str = "sqlite+aiosqlite:///./recruiter_bot.db"
+    mongodb_url: str = "mongodb://127.0.0.1:27017"
+    mongodb_database: str = "job_recruiter_db"
 
-    # ─── Gmail ──────────────────────────────────────────────
-    gmail_sender_email: str = ""
-    gmail_credentials_file: str = "credentials.json"
-    gmail_token_file: str = "token.json"
+
 
     # ─── Resume ─────────────────────────────────────────────
     resume_file_path: str = "resume.pdf"

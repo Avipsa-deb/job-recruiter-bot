@@ -22,8 +22,8 @@ from fastapi import FastAPI
 from app.config import settings
 from app.routes import health
 from app.routes import search
-from app.db.database import init_db
-from app.models import job  # noqa: F401 — must be imported so SQLAlchemy registers the table
+from app.db.database import init_db, close_db
+  
 
 
 def create_app() -> FastAPI:
@@ -45,23 +45,21 @@ def create_app() -> FastAPI:
     )
 
     # ─── Register Routers ────────────────────────────────────────
-    # Each router handles a specific feature area.
-    # We'll add linkedin_router, gmail_router, etc. in later steps.
+   # Each router handles a specific feature area.
     app.include_router(health.router)
     app.include_router(search.router)   # ← NEW in Step 2
 
     # ─── Lifecycle Events ────────────────────────────────────────
     @app.on_event("startup")
     async def on_startup():
-        """Runs once when the server starts."""
-        await init_db()  # ← NEW: creates recruiter_bot.db + tables if they don't exist
+        await init_db()
+
         print(f"✅ {settings.app_name} v{settings.app_version} started")
-        print("📦 Database tables ready (recruiter_bot.db)")
         print("📖 Docs available at: http://localhost:8000/docs")
 
     @app.on_event("shutdown")
     async def on_shutdown():
-        """Runs once when the server shuts down (Ctrl+C)."""
+        await close_db()
         print("🛑 Server shutting down...")
 
     return app
